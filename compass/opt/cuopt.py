@@ -1,4 +1,24 @@
 from typing import Any
+import multiprocessing
+
+MULTIPROCESSING_CONFIGURED = False
+
+def configure_multiprocessing():
+    """
+    Sets multiprocessing to use spawn instead of fork.
+    This is because CUDA does not support forking, though for non-CUDA runs forking is 
+    generally faster.
+    """
+    global MULTIPROCESSING_CONFIGURED
+    if not MULTIPROCESSING_CONFIGURED:
+        try:
+            multiprocessing.set_start_method('spawn')
+        except RuntimeError:
+            pass
+        MULTIPROCESSING_CONFIGURED = True
+
+configure_multiprocessing()
+
 from cuopt.linear_programming.problem import Problem, Variable, Constraint, CONTINUOUS, MAXIMIZE, MINIMIZE
 from cuopt.linear_programming.solver_settings import SolverSettings, PDLPSolverMode
 from cuopt.linear_programming.solver.solver_parameters import (
@@ -46,6 +66,7 @@ from cuopt.linear_programming.solver.solver_parameters import (
 from compass.globals import EXCHANGE_LIMIT
 from compass.models.MetabolicModel import MetabolicModel
 from compass.opt.base import LinearProgramDelta, Optimizer, Solution
+
 
 def get_cuopt_config(threads: int | None = None, method: int | None = None) -> dict[str, Any]:
     if threads is None:

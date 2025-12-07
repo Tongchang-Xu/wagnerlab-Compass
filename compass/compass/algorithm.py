@@ -14,7 +14,6 @@ import numpy as np
 
 from compass.models.MetabolicModel import MetabolicModel, Reaction
 from compass.opt.base import LinearProgramDelta, Optimizer, Solution
-from compass.opt.cuopt import CuoptOptimizer, get_cuopt_config
 from compass.opt.gurobi import GurobiOptimizer, get_gurobi_config
 from .. import utils
 from .. import models
@@ -495,10 +494,10 @@ def compass_reactions(
 
     return reaction_scores
 
-
 def initialize_optimization(model: MetabolicModel, args) -> Optimizer:
     """
     Builds a flux balance analysis model from the specified metabolic model.
+    Uses args to determine which optimizer will be used and how to configure it.
     """
     num_threads = args.get('num_threads')
     lpmethod = args.get('lpmethod')
@@ -507,97 +506,13 @@ def initialize_optimization(model: MetabolicModel, args) -> Optimizer:
         config = get_gurobi_config(num_threads, lpmethod)
         return GurobiOptimizer(model, config, credentials=credentials)
     elif args['optimizer'] == "cuopt":
+        from compass.opt.cuopt import CuoptOptimizer, get_cuopt_config
         # Ignoring the lpmethod for now, as gurobi and cplex differ in methods.
+        if 'cuopt_gpu' in args:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(args['cuopt_gpu'])
         config = get_cuopt_config(num_threads, None)
         return CuoptOptimizer(model, config)
         
-
-def initialize_gurobi_model(model, credentials, num_threads=1, lpmethod=-1, adv=2):
-    # type: (compass.models.MetabolicModel)
-    """
-    Builds and returns a gurobi model representing our metabolic model
-
-    Limits exchange reactions and makes all reactions unidirectional
-    by splitting into two components
-    """
-
-    # Create the Gurobi model
-
-    # Gurobi WLS License
-    if 'WLSACCESSID' in credentials and 'WLSSECRET' in credentials and 'LICENSEID' in credentials:
-        env = gp.Env(params=credentials)
-    # Gurobi Named-User License
-    else:
-        env = gp.Env()
-    
-    gp_model = gp.Model(env=env)
-
-    # Set Parameters for the Gurobi model
-
-    gp_model.setParam("OutputFlag", 0)  # Disable all output
-    gp_model.setParam("LogToConsole", 0)  # Disable console output
-
-    # Set numerical emphasis to improve precision
-    gp_model.setParam("NumericFocus", 3)  # Equivalent to numerical emphasis in CPLEX
-
-    # Set number of threads
-    gp_model.setParam("Threads", num_threads)  # Set the number of threads to use
-
-    # Set the primal and dual preprocessing options
-    gp_model.setParam("Presolve", 2)  # 2 means aggressive presolve, 1 for conservative, 0 for off
-
-    # Set optimization method
-    gp_model.setParam("Method", lpmethod)  # 0: Automatic, 1: Primal Simplex, 2: Dual Simplex, etc.
-
-    # Set optimality tolerance
-    gp_model.setParam("OptimalityTol", 1e-9)  # Default is 1e-6, minimum is 1e-9
-
-    # Set barrier convergence tolerance
-    gp_model.setParam("BarConvTol", 1e-12)  # Default is 1e-8, minimum is 1e-12
-
-    gp_model.setParam(GRB.Param.Threads, num_threads)
-    gp_model.setParam(GRB.Param.Method, lpmethod)
-
-    # Add variables
-    reactions = list(model.reactions.values())
-
-    # Define minimum and maximum flux for each reaction
-    for x in reactions:
-        gp_model.addVar(
-            lb=x.lower_bound, 
-            ub=x.upper_bound, 
-            name=x.id, 
-            vtype=GRB.CONTINUOUS)
-    gp_model.update()
-
-    # Add constraints
-
-    # Add stoichiometry constraints
-
-    '''
-    utils.get_steadystate_constraints
-
-    For each metabolite:
-        c_lin_expr is the zero flux linear expression, of form
-            c_1 * r_1 + c_2 * r_2 + ... + c_m * r_m = 0
-        sense is 'E', representing equal to 0
-        rhs is 0
-        name of corresponding metabolite is given to entire linear expression, not variables
-    '''
-
-    c_lin_expr, c_rhs, c_names = (
-        utils.get_steadystate_constraints(model, gp_model))
-
-    for lin_expr, rhs, name in zip(c_lin_expr, c_rhs, c_names):
-        gp_model.addConstr(lin_expr == rhs, name=name)
-    gp_model.update()
-
-    # Initialize the objective
-    ### utils.reset_objective(gp_model)
-
-    return gp_model
-
-
 def maximize_reaction(
         model: MetabolicModel, 
         opt: Optimizer, 
@@ -854,18 +769,6 @@ def maximize_metab_range(start_stop, args, model_name=None, metabolic_model_dir=
         sub_cache[uptake_rxn] = sol.obj_value
             
     return sub_cache
-
-
-def optimize_model_wrapper(gp_model) -> float:
-    r"""
-    Only optimize the Gurobi model if the reaction is selected for the cell. Else,
-    skip the computation and return np.nan.
-    """
-    if global_state.current_reaction_is_selected_for_current_cell():
-        gp_model.optimize()
-        return gp_model.ObjVal
-    else:
-        return np.nan
     
 def solve_model_wrapper(opt: Optimizer, delta: LinearProgramDelta) -> Solution:
     r"""

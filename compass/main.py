@@ -49,7 +49,10 @@ def parseArgs():
                         prog="Compass",
                         description="Compass version "+str(__version__)+
                         ". Metabolic Modeling for Single Cells. "
-                        "For more details on usage refer to the documentation: https://github.com/wagnerlab-berkeley/Compass")
+                        "For more details on usage refer to the documentation: https://github.com/wagnerlab-berkeley/Compass",
+                        add_help=False)
+
+    parser.add_argument('-h', '--help', action='store_true', help='show this help message and exit')
 
     parser.add_argument("--data", help="Gene expression matrix." 
                         " Should be a tsv file with one row per gene and one column per sample", 
@@ -136,11 +139,6 @@ def parseArgs():
                         help="Number of threads to use per sample",
                         type=int, default=1,
                         metavar="N")
-    
-    parser.add_argument("--optimizer",
-                        help = "Select an optimization software to solve flux balance analysis problems with",
-                        choices=["gurobi", "cuopt"],
-                        default="gurobi")
 
     parser.add_argument("--turbo",
                         help="If you are willing to sacrifice some accuracy in favour of speed, "
@@ -359,11 +357,11 @@ def parseArgs():
                         help=argparse.SUPPRESS,
                         default='')
 
-    #Hidden argument to choose the algorithm CPLEX uses. Barrier generally best choice.
+    #Hidden argument to choose the algorithm the optimizer uses. Barrier generally best choice.
     #See - https://www.ibm.com/support/knowledgecenter/en/SS9UKU_12.10.0/com.ibm.cplex.zos.help/CPLEX/Parameters/topics/LPMETHOD.html
     parser.add_argument("--lpmethod",
                         help=argparse.SUPPRESS,
-                        default=4,
+                        default=None,
                         type=int)
 
     #Hidden argument to choose the setting for Cplex's advanced basis setting. Generally 2 is the best, but for ease of testing I've added it here.
@@ -389,6 +387,32 @@ def parseArgs():
 
     parser.add_argument("--list-reactions", default=None, metavar="FILE",
                         help="File to output a list of reaction id's and their associated subsystem for selected metabolic model.")
+
+    parser.add_argument("--optimizer",
+                        help = "Select an optimization software to solve flux balance analysis problems with. Select an optimizer with --help to see options specific to the optimizer",
+                        choices=["gurobi", "cuopt"],
+                        default="gurobi")
+
+    # Parse known args first to check for optimizer setting
+    args, _ = parser.parse_known_args()
+
+    if args.optimizer == "cuopt":
+        cuopt_group = parser.add_argument_group('CuOpt Options')
+        cuopt_group.add_argument("--cuopt-gpu",
+                            help="Select which GPU to use for cuopt optimizer.",
+                            type=int,
+                            default=0,
+                            metavar="ID")
+        default_method = 1 #pdlp 
+    elif args.optimizer == "gurobi":
+        default_method = 4
+    
+    if args.lpmethod is None:
+        args.lpmethod = default_method
+
+    if args.help:
+        parser.print_help()
+        sys.exit(0)
 
     args = parser.parse_args()
 
