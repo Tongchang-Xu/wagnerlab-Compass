@@ -292,25 +292,40 @@ class CuoptServerOptimizer(Optimizer):
         #    msgpack.pack()
 
         client = get_cuopt_client(self.ip, self.port)
+        # Note 1: On any key error, the object becomes a dict. So while I would prefer the obj response, I use the dict for now
+        # Note 2: The client currently will throw an Exception for HTTP error codes, so we don't have to be concerned with those.
+        # Note 3: There is no discriminator for which schema the response follows, so I use a crude way here
         solution = client.get_LP_solve(
             problem,
             response_type="dict",
         )
 
         poll_count = 0
-        while "response" not in solution:
-            if "reqId" not in solution:
-                # This is fatal because we cannot repoll without a reqId
-                print(solution)
-                raise Exception(f"reqId missing from solution: keys are {solution.keys()}")
+        # The three schemas here are
+        # 1) Pending, will have reqId
+        # 2) Response HTTP, will have response
+        # 3) Response filesystem, will have result_file
+        while "reqId" in solution:
             poll_count += 1
             if poll_count > _REPOLL_TIMEOUT:
                 return Solution(success=False, status="Repolling timeout", obj_value=None)
             time.sleep(_REPOLL_INTERVAL)
             solution = client.repoll(solution["reqId"], response_type="dict")
-
-        resp = solution["response"]
-        if resp["status"] == "Optimal":
+        
+        if "response" in solution:
+            resp = solution["response"]
+        elif "result_file" in solution:
+            file_path = os.path.join(self.results_dir, solution["result_file"])
+            with open(file_path, 'rb') as f:
+                if solution["format"] == "msgpack":
+                    resp = msgpack.unpack(f)["response"]["solver_response"]
+                else:
+                    raise Exception(f"Unhandled solution format {solution['format']}")
+        else:
+            raise Exception(f"Unrecognized solution schema. Found keys: {solution.keys()}")
+        
+        status = resp["status"]
+        if status == "Optimal":
             success = True
             obj_value = resp["solution"]["primal_objective"]
         else:
