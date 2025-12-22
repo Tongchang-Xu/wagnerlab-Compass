@@ -34,8 +34,6 @@ class LinearProgramDelta:
     # Reaction ID -> new minimum flux
     # Used to add the constraints for the maximum flux to be near v_r^opt
     high_flux: dict[str, np.float64] = field(default_factory=dict)
-    # Used for saving intermediate results on file system. Used by cuopt_server only for now.
-    name: str | None
 
 
 @dataclass

@@ -413,7 +413,7 @@ def parseArgs():
                             metavar="gpus")
         cuopt_server_group.add_argument("--cuopt-ip",
                             help="Select IP for cuopt server. Defaults to 0.0.0.0 (same as cuopt default)",
-                            type=str | None,
+                            type=str,
                             default="0.0.0.0",
                             metavar="ip")
         cuopt_server_group.add_argument("--cuopt-port",

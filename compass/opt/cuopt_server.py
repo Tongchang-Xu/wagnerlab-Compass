@@ -87,17 +87,34 @@ class CuoptServerProcess:
 
         abs_path = os.path.abspath(output_dir)
         self.data_dir = os.path.join(abs_path, CUOPT_DATA_PATH)
+        if not os.path.exists(self.data_dir):
+            os.mkdir(self.data_dir)
         self.results_dir = os.path.join(abs_path, CUOPT_RESULTS_PATH)
+        if not os.path.exists(self.results_dir):
+            os.mkdir(self.results_dir)
         # TODO: max_result should be tuned for performance.
         self.max_result = 250
         self.log_file = os.path.join(abs_path, CUOPT_LOG_PATH)
 
-        # Check if server is already running
+        # TODO: Add logging.
 
+        # We use a custom launcher to:
+        # 1. Import logging.handlers to avoid
+        # AttributeError: module 'logging' has no attribute 'handlers'. Did you mean: '_handlers'?
+        # 2. Run by path to avoid runpy RuntimeWarning:
+        # cuopt_server.cuopt_service' found in sys.modules after import of package 'cuopt_server', but prior to execution of 'cuopt_server.cuopt_service'; this may result in unpredictable behaviour
+        launcher_code = (
+            "import logging.handlers; "
+            "import os, runpy, cuopt_server; "
+            "pkg_path = os.path.dirname(cuopt_server.__file__); "
+            "script_path = os.path.join(pkg_path, 'cuopt_service.py'); "
+            "runpy.run_path(script_path, run_name='__main__')"
+        )
+        
         cmd = [
             python_exe,
-            "-m",
-            "cuopt_server.cuopt_service",
+            "-c",
+            launcher_code,
             "--ip",
             ip,
             "--port",
@@ -110,14 +127,16 @@ class CuoptServerProcess:
             self.results_dir,
             "--maxresult",
             str(self.max_result),
-            "--log_file",
+            "--log-level",
+            "warning",
+            "--log-file",
             self.log_file,
         ]
 
         stdout_log = os.path.join(abs_path, "cuopt_server.stdout")
         stderr_log = os.path.join(abs_path, "cuopt_server.stderr")
-        stdout_f = open(stdout_log, "a")
-        stderr_f = open(stderr_log, "a")
+        stdout_f = open(stdout_log, "w")
+        stderr_f = open(stderr_log, "w")
 
         self.ip = ip
         self.port = port
@@ -138,7 +157,7 @@ class CuoptServerProcess:
         raise Exception("Could not verify status of cuopt server")
 
     def get_params(self) -> CuoptServerParameters:
-        CuoptServerParameters(ip=self.ip, port=self.port, data_dir=self.data_dir, results_dir=self.results_dir)
+        return CuoptServerParameters(ip=self.ip, port=self.port, data_dir=self.data_dir, results_dir=self.results_dir)
 
     def shutdown(self):
         self.proc.terminate()
@@ -272,7 +291,7 @@ class CuoptServerOptimizer(Optimizer):
         # with open(filepath, "wb") as f:
         #    msgpack.pack()
 
-        client = get_cuopt_client()
+        client = get_cuopt_client(self.ip, self.port)
         solution = client.get_LP_solve(
             problem,
             response_type="dict",
@@ -282,6 +301,7 @@ class CuoptServerOptimizer(Optimizer):
         while "response" not in solution:
             if "reqId" not in solution:
                 # This is fatal because we cannot repoll without a reqId
+                print(solution)
                 raise Exception(f"reqId missing from solution: keys are {solution.keys()}")
             poll_count += 1
             if poll_count > _REPOLL_TIMEOUT:
