@@ -11,6 +11,11 @@ import numpy as np
 import msgpack
 import msgpack_numpy
 from cuopt_sh_client import CuOptServiceSelfHostClient
+import logging
+
+# Suppress chatty logs from the client library that interfere with tqdm
+logging.getLogger("cuopt_sh_client").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 msgpack_numpy.patch()
 
@@ -85,6 +90,7 @@ class CuoptServerProcess:
         if python_exe is None or len(python_exe) == 0:
             raise Exception("sys.executable is None or empty; not possible to find current python interpreter")
 
+        # TODO Use temp dir instead of output
         abs_path = os.path.abspath(output_dir)
         self.data_dir = os.path.join(abs_path, CUOPT_DATA_PATH)
         if not os.path.exists(self.data_dir):
