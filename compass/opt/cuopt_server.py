@@ -17,6 +17,8 @@ import logging
 logging.getLogger("cuopt_sh_client").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+logger = logging.getLogger("compass")
+
 msgpack_numpy.patch()
 
 from compass.models.MetabolicModel import MetabolicModel
@@ -33,7 +35,6 @@ _REPOLL_INTERVAL = 1
 _REPOLL_TIMEOUT = 6000
 
 _CUOPT_CLIENT = None
-
 
 def get_cuopt_client(ip: str, port: str) -> CuOptServiceSelfHostClient:
     """
@@ -101,8 +102,6 @@ class CuoptServerProcess:
         # TODO: max_result should be tuned for performance.
         self.max_result = 250
         self.log_file = os.path.join(abs_path, CUOPT_LOG_PATH)
-
-        # TODO: Add logging.
 
         # We use a custom launcher to:
         # 1. Import logging.handlers to avoid
@@ -176,7 +175,7 @@ class CuoptServerProcess:
         try:
             self.proc.wait(5)
         except sp.TimeoutExpired:
-            print("Cuopt server failed to exit after terminate and kill", file=sys.stderr)
+            logger.error("Cuopt server failed to exit after terminate and kill")
 
 
 class CuoptServerOptimizer(Optimizer):
@@ -207,7 +206,7 @@ class CuoptServerOptimizer(Optimizer):
             rxn_ub.append(reaction.upper_bound)
         assert len(rxn_map) == len(rxn_lb)
 
-        # Construct as COO, so we can edit rows
+        # Construct as COO, so we can edit rows more easily than CSR
         rows = []
         cols = []
         vals = []
@@ -290,12 +289,6 @@ class CuoptServerOptimizer(Optimizer):
                 "cudss_deterministic": True,
             },
         }
-
-        # assert delta.name is not None
-        # filename = f"{delta.name}.msgpack"
-        # filepath = os.path.join(self.data_dir, filename)
-        # with open(filepath, "wb") as f:
-        #    msgpack.pack()
 
         client = get_cuopt_client(self.ip, self.port)
         # Note 1: On any key error, the object becomes a dict. So while I would prefer the obj response, I use the dict for now

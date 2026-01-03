@@ -8,7 +8,6 @@ from compass.globals import BETA, EXCHANGE_LIMIT
 from compass.models.MetabolicModel import MetabolicModel
 from .base import Optimizer, LinearProgramDelta, Solution
 
-# TODO: Add a proper logging heirachy here.
 logger = logging.getLogger("compass")
 
 
@@ -102,8 +101,6 @@ class GurobiOptimizer(Optimizer):
         added_vars = []
         added_constraints = []
 
-        # TODO: Double check EXCHANGE_LIMIT vs maximum_flux asymmetry
-        # Probably due to limited physical uptake rates vs arbitrary secretion
         for met_id, rxn_id in delta.added_secretion.items():
             met_constr = self.gp_model.getConstrByName(met_id)
             rxn_var = self.gp_model.addVar(lb=0.0, ub=self.model.maximum_flux, name=rxn_id, vtype=GRB.CONTINUOUS)

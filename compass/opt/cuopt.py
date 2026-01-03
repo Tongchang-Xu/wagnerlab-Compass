@@ -205,11 +205,10 @@ class CuoptOptimizer(Optimizer):
             sense = MINIMIZE
         self.problem.setObjective(objective_expr, sense)
 
-        self.problem.solve(self.solver_settings)
-        # try:
-        #    self.problem.solve(self.solver_settings)
-        # except Exception as e:
-        #    raise RuntimeError("Exception while solving cuOpt problem") from e
+        try:
+            self.problem.solve(self.solver_settings)
+        except Exception as e:
+            raise RuntimeError("Exception while solving cuOpt problem") from e
 
         # Don't think cuOpt exports the constant of interest to python here, but CUOPT_SUCCESS=0
         status = self.problem.Status

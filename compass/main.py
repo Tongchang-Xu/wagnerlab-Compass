@@ -641,7 +641,7 @@ def entry():
     logger.debug("\nCOMPASS Started: {}".format(start_time))
     # Parse arguments and decide what course of action to take
 
-    context = compass_entry_setup(args)
+    context = compass_entry_setup(args, logger)
 
     try:
         compass_work(args, logger, start_time)
@@ -649,7 +649,7 @@ def entry():
         compass_entry_cleanup(context)
 
 
-def compass_entry_setup(args):
+def compass_entry_setup(args, logger):
     context = {}
     if args['optimizer'] == "cuopt_server":
         from compass.opt.cuopt_server import CuoptServerProcess
@@ -659,6 +659,7 @@ def compass_entry_setup(args):
             ip=args['cuopt_ip'], 
             port=args['cuopt_port']
         )
+        logger.debug(f"Spawned cuopt server process PID={process.proc.pid}")
         # Store params for the CuoptServerOptimizer in args, so they can be passed to each sub process
         args['cuopt_server_params'] = process.get_params()
         context['cuopt_server_proc'] = process
