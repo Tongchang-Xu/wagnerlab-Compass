@@ -329,7 +329,7 @@ def compass_exchange(
             added_uptake=added_uptake
         )
 
-        # Constrain secretion to be at least BETA * _r^opt
+        # Constrain secretion to be at least BETA * v_r^opt
         high_flux = { secretion_rxn: BETA * secretion_max }
 
         # Minimize Penalty
@@ -680,6 +680,7 @@ def maximize_metab_range(start_stop, args, model_name=None, metabolic_model_dir=
         secretion_rxn = None
         extra_secretion_rxns = []
 
+        # Maps the metabolite id to the name of the new reaction
         added_uptake = {}     # Did we add an uptake reaction?
         added_secretion = {}  # "   "   "  "  secretion reaction?
 
