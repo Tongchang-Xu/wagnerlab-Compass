@@ -22,7 +22,7 @@ def create_process_pool(args):
     Creates multiprocessing pool for compass
     Configures multiprocessing to avoid issues if CUDA is being used.
     """
-    if args['optimizer'] == "cuopt":
+    if args["optimizer"] == "cuopt":
         from .opt.cuopt import configure_multiprocessing
         configure_multiprocessing()
     return multiprocessing.Pool(args['num_processes'])

@@ -50,8 +50,15 @@ class _SelectedReactionsForEachCell():
 
 
 def init_selected_reactions_for_each_cell(path: Optional[str]) -> None:
+    """
+    Initializes global state for module compass
+    Note that if multiprocessing is using spawn instead of fork, this will need to be called by each
+    process running compass. Fork on the other hand will retain the global values.
+    Whether fork or spawn is used depends on: python version, OS, and optimizer selected (CUDA cannot use fork)
+    """
     global _selected_reactions_for_each_cell
-    _selected_reactions_for_each_cell = _SelectedReactionsForEachCell(path)
+    if _selected_reactions_for_each_cell is None:
+        _selected_reactions_for_each_cell = _SelectedReactionsForEachCell(path)
 
 
 def set_current_cell_name(cell_name: str) -> None:
@@ -73,4 +80,6 @@ def get_current_reaction_id() -> str:
 
 
 def current_reaction_is_selected_for_current_cell() -> bool:
+    if _selected_reactions_for_each_cell is None:
+        raise Exception("_selected_reactions_for_each_cell is None - this indicates a bug due to multiprocessing interaction with globals (which varies across python version and OS)")
     return _selected_reactions_for_each_cell.is_selected(_current_cell_name, _current_reaction_id)

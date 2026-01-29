@@ -1754,9 +1754,15 @@ def load_config(args):
     args.update(newArgs)
 
 def _parallel_map_precache_reactions(start_stop, args, model_name=None, metabolic_model_dir=MODEL_DIR):
+    global_state.init_selected_reactions_for_each_cell(
+        args.get('selected_reactions_for_each_cell', None))
+    
     return maximize_reaction_range(start_stop, args, model_name=model_name, metabolic_model_dir=metabolic_model_dir)
 
 def _parallel_map_precache_metabs(start_stop, args, model_name=None, metabolic_model_dir=MODEL_DIR):
+    global_state.init_selected_reactions_for_each_cell(
+        args.get('selected_reactions_for_each_cell', None))
+    
     return maximize_metab_range(start_stop, args, model_name=model_name, metabolic_model_dir=metabolic_model_dir)
 
 def precacheCompass(args, model_name=None, metabolic_model_dir=MODEL_DIR, preprocess_cache_dir=PREPROCESS_CACHE_DIR):

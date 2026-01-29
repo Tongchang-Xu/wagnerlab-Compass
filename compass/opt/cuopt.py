@@ -14,7 +14,10 @@ def configure_multiprocessing():
         try:
             multiprocessing.set_start_method("spawn")
         except RuntimeError as e:
-            raise Exception(f"Error seting multiprocessing start method to spawn for CUDA") from e
+            method = multiprocessing.get_start_method(allow_none=True)
+            if method != "spawn":
+             # Note for readers: CUDA init will fail if a process is forked.
+             raise Exception(f"Multiprocessing start method was already set to {method}, but CUDA requires spawn") from e
         MULTIPROCESSING_CONFIGURED = True
 
 
