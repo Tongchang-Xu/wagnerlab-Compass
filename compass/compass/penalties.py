@@ -262,7 +262,7 @@ def computeReactionExpressionParallel(args, model, expression, and_function, sam
                               model=model, and_function=and_function,
                               sample_names_chunks=sample_names_chunks, temp_dir=temp_dir)
 
-    pool = multiprocessing.Pool(args['num_processes'])
+    pool = utils.create_process_pool(args)
 
     logger.info(
         "Computing penalties using {} processes"

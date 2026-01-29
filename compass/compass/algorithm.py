@@ -509,10 +509,6 @@ def initialize_optimization(model: MetabolicModel, args) -> Optimizer:
         from compass.opt.cuopt import CuoptOptimizer, get_cuopt_config
         config = get_cuopt_config(num_threads, method=lpmethod)
         return CuoptOptimizer(model, config)
-    elif args["optimizer"] == "cuopt_server":
-        from compass.opt.cuopt_server import CuoptServerOptimizer
-        # This key should be initialized in main
-        return CuoptServerOptimizer(model, args['cuopt_server_params'])
 
 def maximize_reaction(
         model: MetabolicModel, 

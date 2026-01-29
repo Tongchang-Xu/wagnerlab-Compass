@@ -694,7 +694,7 @@ def compass_work(args, logger, start_time):
                     
                     n_samples = penalties.shape[1]
 
-                    pool = multiprocessing.Pool(args['num_processes'])
+                    pool = utils.create_process_pool(args)
 
                     pbar = tqdm(total=n_samples)
 
@@ -740,7 +740,7 @@ def compass_work(args, logger, start_time):
                     os.mkdir(penalties_dir)
                 
                 n_samples = penalties.shape[1]
-                pool = multiprocessing.Pool(args['num_processes'])
+                pool = utils.create_process_pool(args)
 
                 logger.info('Saving Reaction Penalties for individual samples')
                 pbar = tqdm(total=n_samples)
@@ -990,7 +990,7 @@ def compass_work(args, logger, start_time):
                             os.mkdir(penalties_dir)
 
                         n_samples = penalties.shape[1]
-                        pool = multiprocessing.Pool(args['num_processes'])
+                        pool = utils.create_process_pool(args)
 
                         logger.info('Saving Reaction Penalties for individual samples')
 
@@ -1105,7 +1105,7 @@ def compass_work(args, logger, start_time):
                         os.mkdir(penalties_dir)
 
                     n_samples = penalties.shape[1]
-                    pool = multiprocessing.Pool(args['num_processes'])
+                    pool = utils.create_process_pool(args)
 
                     logger.info('Saving Reaction Penalties for individual samples')
                     pbar = tqdm(total=n_samples)
@@ -1283,7 +1283,7 @@ def compass_work(args, logger, start_time):
                         os.mkdir(penalties_dir)
                     
                     n_samples = penalties.shape[1]
-                    pool = multiprocessing.Pool(args['num_processes'])
+                    pool = utils.create_process_pool(args)
 
                     logger.info('Saving Reaction Penalties for individual samples')
                     pbar = tqdm(total=n_samples)
@@ -1425,7 +1425,7 @@ def compass_work(args, logger, start_time):
                     os.mkdir(penalties_dir)
                 
                 n_samples = penalties.shape[1]
-                pool = multiprocessing.Pool(args['num_processes'])
+                pool = utils.create_process_pool(args)
 
                 logger.info('Saving Reaction Penalties for individual samples')
                 pbar = tqdm(total=n_samples)
@@ -1506,7 +1506,7 @@ def runCompassParallel(args, model_name=None, temp_dir=None, output_dir=None, me
     sample_names = list(data.columns)
     del data
 
-    pool = multiprocessing.Pool(args['num_processes'])
+    pool = utils.create_process_pool(args)
 
     logger.info(
         "Processing {} samples using {} processes"
@@ -1792,7 +1792,7 @@ def precacheCompass(args, model_name=None, metabolic_model_dir=MODEL_DIR, prepro
 
         combined_cache = {}
         partial_map_fun = partial(_parallel_map_precache_reactions, args=args, model_name=model_name, metabolic_model_dir=metabolic_model_dir)
-        pool = multiprocessing.Pool(n_processes)
+        pool = utils.create_process_pool(args)
         for sub_cache in pool.imap_unordered(partial_map_fun, reaction_chunks):
             combined_cache.update(sub_cache)
         
@@ -1800,7 +1800,7 @@ def precacheCompass(args, model_name=None, metabolic_model_dir=MODEL_DIR, prepro
         metab_chunks = [(i*metab_chunk_size, min(n_metabs, (i+1)*metab_chunk_size)) for i in range(n_processes)]
 
         partial_map_fun = partial(_parallel_map_precache_metabs, args=args, model_name=model_name, metabolic_model_dir=metabolic_model_dir)
-        pool = multiprocessing.Pool(n_processes)
+        pool = utils.create_process_pool(args)
         for sub_cache in pool.imap_unordered(partial_map_fun, metab_chunks):
             combined_cache.update(sub_cache)
 

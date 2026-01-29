@@ -3,7 +3,6 @@ import multiprocessing
 
 MULTIPROCESSING_CONFIGURED = False
 
-
 def configure_multiprocessing():
     """
     Sets multiprocessing to use spawn instead of fork.
@@ -14,10 +13,8 @@ def configure_multiprocessing():
     if not MULTIPROCESSING_CONFIGURED:
         try:
             multiprocessing.set_start_method("spawn")
-        except RuntimeError:
-            # IF this has already been set somewhere else in the process, 
-            # we will just proceed and trust it was correctly set.
-            pass
+        except RuntimeError as e:
+            raise Exception(f"Error seting multiprocessing start method to spawn for CUDA") from e
         MULTIPROCESSING_CONFIGURED = True
 
 

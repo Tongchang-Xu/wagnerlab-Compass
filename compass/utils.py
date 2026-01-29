@@ -5,6 +5,7 @@ Functions to be used by other optimization routines
 """
 
 from __future__ import print_function, division
+import multiprocessing
 import scipy.io
 import pandas as pd
 import numpy as np
@@ -13,6 +14,18 @@ import os
 import anndata
 
 import gurobipy as gp
+
+MULTIPROCESSING_CONFIGURED = False
+
+def create_process_pool(args):
+    """
+    Creates multiprocessing pool for compass
+    Configures multiprocessing to avoid issues if CUDA is being used.
+    """
+    if args['optimizer'] == "cuopt":
+        from .opt.cuopt import configure_multiprocessing
+        configure_multiprocessing()
+    return multiprocessing.Pool(args['num_processes'])
 
 def get_steadystate_constraints(model, gp_model):
 
