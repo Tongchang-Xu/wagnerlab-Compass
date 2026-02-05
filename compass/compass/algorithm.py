@@ -775,6 +775,9 @@ def solve_model_wrapper(opt: Optimizer, delta: LinearProgramDelta) -> Solution:
     skip the computation and return np.nan as the optimal value
     """
     if global_state.current_reaction_is_selected_for_current_cell():
-        return opt.solve(delta)
+        sol = opt.solve(delta)
+        if not sol.success:
+            logger.error("Failed to solve linear program: %s", sol.status)
+        return sol
     else:
         return Solution(success=True, status="Skipped", obj_value=np.nan)

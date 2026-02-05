@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 import multiprocessing
 
@@ -71,6 +72,7 @@ from compass.globals import EXCHANGE_LIMIT
 from compass.models.MetabolicModel import MetabolicModel
 from compass.opt.base import LinearProgramDelta, Optimizer, Solution
 
+logger = logging.getLogger("compass")
 
 def get_cuopt_config(threads: int | None = None, method: int | None = None) -> dict[str, Any]:
     """
@@ -99,6 +101,8 @@ def get_cuopt_config(threads: int | None = None, method: int | None = None) -> d
         CUOPT_METHOD: method,
         # Determinism is preferrable for replication.
         CUOPT_CUDSS_DETERMINISTIC: True,
+        # Each problem should take well under 120 seconds.
+        CUOPT_TIME_LIMIT: 120,
     }
 
 
@@ -208,14 +212,13 @@ class CuoptOptimizer(Optimizer):
         self.problem.setObjective(objective_expr, sense)
 
         try:
-            self.problem.solve(self.solver_settings)
+            self.solve_problem()
         except Exception as e:
             raise RuntimeError("Exception while solving cuOpt problem") from e
 
-        # Don't think cuOpt exports the constant of interest to python here, but CUOPT_SUCCESS=0
         status = self.problem.Status
         obj_value = self.problem.ObjValue
-        if self.problem.Status == 0:
+        if status.name == "Optimal":
             success = True
         else:
             success = False
@@ -230,3 +233,20 @@ class CuoptOptimizer(Optimizer):
                 self.variables[rxn_id].setLowerBound(lb)
 
         return Solution(success=success, status=status, obj_value=obj_value)
+    
+    def solve_problem(self):
+        self.problem.solve(self.solver_settings)
+        if self.problem.Status.name == "Optimal":
+            return
+        
+        logger.info("Received non-optimal status %s. Retrying with automatic method selection", self.problem.Status.name)
+        original_method = self.solver_settings.get_parameter(CUOPT_METHOD)
+
+        # Retry with concurrent method, as that will try all methods
+        try:
+            self.solver_settings.set_parameter(CUOPT_METHOD, 0)
+            self.problem.solve(self.solver_settings)
+        finally:
+            self.solver_settings.set_parameter(CUOPT_METHOD, original_method)
+        return
+        
