@@ -11,6 +11,10 @@ import sys
 import time
 import timeit
 import numpy as np
+
+from compass.models.MetabolicModel import MetabolicModel, Reaction
+from compass.opt.base import LinearProgramDelta, Optimizer, Solution
+from compass.opt.gurobi import GurobiOptimizer, get_gurobi_config
 from .. import utils
 from .. import models
 from . import cache
@@ -80,8 +84,7 @@ def singleSampleCompass(data, model, media, directory, sample_name, sample_index
         cache.clear(model, preprocess_cache_dir=preprocess_cache_dir) #TBD add media specifier here too
 
     # Build model into Gurobi model
-    credentials = utils.parse_gurobi_license_file(os.path.join(LICENSE_DIR, 'gurobi.lic'))
-    gp_model = initialize_gurobi_model(model, credentials, args['num_threads'], args['lpmethod'], args['advance'])
+    opt = initialize_optimization(model, args)
     
     logger.info(f'Processing Sample {sample_index}: {sample_name}')
     global_state.set_current_cell_name(sample_name)
@@ -93,11 +96,12 @@ def singleSampleCompass(data, model, media, directory, sample_name, sample_index
     reaction_penalties = pd.read_csv(
         os.path.join(args['penalties_dir'], f'sample{sample_index}', 'penalties.txt.gz'), index_col=0, sep='\t').iloc[:, 0]
 
+    reaction_penalties_dict = dict(reaction_penalties.items())
     react_start = time.process_time()
     if not args['no_reactions']:
         logger.info("Evaluating Reaction Scores...")
         reaction_scores = compass_reactions(
-            model, gp_model, reaction_penalties,
+            model, opt=opt, reaction_penalties=reaction_penalties_dict,
             perf_log=perf_log, args=args, preprocess_cache_dir=preprocess_cache_dir)
     react_elapsed = time.process_time() - react_start
 
@@ -105,7 +109,7 @@ def singleSampleCompass(data, model, media, directory, sample_name, sample_index
     logger.info("Evaluating Exchange/Secretion/Uptake Scores...")
     exchange_start = time.process_time()
     uptake_scores, secretion_scores, exchange_rxns = compass_exchange(
-        model, gp_model, reaction_penalties,
+        model, opt=opt, reaction_penalties=reaction_penalties_dict,
         only_exchange=(not args['no_reactions']) and not args['calc_metabolites'],
         perf_log=perf_log, args=args, preprocess_cache_dir=preprocess_cache_dir)
     exchange_elapsed = time.process_time() - exchange_start
@@ -178,7 +182,15 @@ def read_selected_reactions(select_reactions, select_subsystems, model):
     return [str(s) for s in selected_reaction_ids]
 
 
-def compass_exchange(model, gp_model, reaction_penalties, only_exchange=False, perf_log=None, args = None, preprocess_cache_dir=PREPROCESS_CACHE_DIR):
+def compass_exchange(
+        model: MetabolicModel, 
+        opt: Optimizer, 
+        reaction_penalties: dict[str, float], 
+        only_exchange=False, 
+        perf_log=None, 
+        args = None, 
+        preprocess_cache_dir=PREPROCESS_CACHE_DIR
+    ):
     """
     Iterates through metabolites, finding each's max
     uptake and secretion potentials. If only_exchange=True, does so only for exchange reactions.
@@ -224,9 +236,9 @@ def compass_exchange(model, gp_model, reaction_penalties, only_exchange=False, p
     for metabolite in tqdm(metabolites, file=sys.stderr):
 
         met_id = metabolite.id
-        met_id_constr = gp_model.getConstrByName(met_id)
+        metabolite_used = model.is_metabolite_used(metabolite_id=met_id)
 
-        if met_id_constr is None:
+        if not metabolite_used:
             # This can happen if the metabolite does not participate
             # in any reaction. As a result, it won't be in any
             # constraints - happens in RECON2
@@ -244,21 +256,30 @@ def compass_exchange(model, gp_model, reaction_penalties, only_exchange=False, p
         secretion_rxn = None
         extra_secretion_rxns = []
 
-        added_uptake = False     # Did we add an uptake reaction?
-        added_secretion = False  # "   "   "  "  secretion reaction?
+        added_uptake = {}     # Did we add an uptake reaction?
+        added_secretion = {}  # "   "   "  "  secretion reaction?
 
         # Metabolites represented by a constraint: get associated reactions
-        sp = gp_model.getRow(met_id_constr)
-        rxn_ids = [sp.getVar(i).varname for i in range(sp.size())]
+        rxn_ids = model.associated_reactions(met_id)
         reactions = [model.reactions[x] for x in rxn_ids]
 
         #If user wants only exchange reaction - limit the reactions space through which we iterate
         if only_exchange:
             reactions = [x for x in reactions if x.is_exchange]
 
+        # Check if any reactions are selected at all
         if args['select_reactions'] or args['select_subsystems']:
             #r.id is a unidirectional identifier (ending with _pos or _neg suffix --> we remove it and compare to the undirected reaction id)
             reactions = [r for r in reactions if ((r.id)[:-4] in selected_reaction_ids or str(r.id) in selected_reaction_ids)]
+
+        # If there are no selected, then go to next metabolite
+        if not reactions:
+            logger.debug(f"Skipping {met_id}")
+            continue
+        
+        # If we care about any of these reactions, then collect optimal uptake and secretion.
+        # NOTE: This may include more reactions than strictly selected
+        reactions = [model.reactions[x] for x in rxn_ids]
 
         # Extra reactions are duplicates
         for reaction in reactions:
@@ -275,43 +296,16 @@ def compass_exchange(model, gp_model, reaction_penalties, only_exchange=False, p
                     extra_secretion_rxns.append(reaction.id)
 
         #if the selected_rxns or only_exchange options are used --> then we don't want to add reactions unless one of the pair already exists
-        if(only_exchange or args['select_reactions']) and (uptake_rxn is None) and (secretion_rxn is None):
+        if (only_exchange or args['select_reactions']) and (uptake_rxn is None) and (secretion_rxn is None):
             continue
-
-        if (secretion_rxn is None):
-            added_secretion = True
+        
+        if secretion_rxn is None:
             secretion_rxn = met_id + "_SECRETION"
+            added_secretion[met_id] = secretion_rxn
 
-            # Add secretion reaction to the problem as a variable
-            rxn_index = gp_model.addVar(
-                name=secretion_rxn,
-                ub=model.maximum_flux,
-                lb=0.0,
-                vtype=GRB.CONTINUOUS,
-            )
-
-            # Add it to the metabolites constraint
-            gp_model.chgCoeff(met_id_constr, rxn_index, -1.0)
-            gp_model.update()
-
-        #if only exchange flag is set - don't add uptakes that do not exist
-        if (uptake_rxn is None):
-            added_uptake = True
+        if uptake_rxn is None:
             uptake_rxn = met_id + "_UPTAKE"
-
-            # Add uptake reaction to the problem as a variable
-            rxn_index = gp_model.addVar(
-                name=uptake_rxn,
-                ub=EXCHANGE_LIMIT,
-                lb=0.0,
-                vtype=GRB.CONTINUOUS,
-            )
-
-            # Add it to the metabolite's constraint
-            # TODO: need to check if met_id_constr is modified by secrete_rxn
-            # Find way to remove gp_model.update() in secrete_rxn
-            gp_model.chgCoeff(met_id_constr, rxn_index, 1.0)
-            gp_model.update()
+            added_uptake[met_id] = uptake_rxn
 
         # Modify the constraint in the problem
         #   e.g. Add the metabolites connections
@@ -321,151 +315,104 @@ def compass_exchange(model, gp_model, reaction_penalties, only_exchange=False, p
         # -----------------
         # Optimal Secretion
         # -----------------
-
-        # Close all uptake, storing their upper-bounds to restore later
-        old_uptake_upper = {}
-        for rxn_id in all_uptake:
-            rxn_var = gp_model.getVarByName(rxn_id)
-            old_ub = rxn_var.ub
-            old_uptake_upper[rxn_id] = old_ub
-            old_lb = rxn_var.lb
-            rxn_var.setAttr('ub', max(old_lb, 0))
-
-        # Close extra secretion, storing upper-bounds to restore later
-        old_secretion_upper = {}
-        for rxn_id in extra_secretion_rxns:
-            rxn_var = gp_model.getVarByName(rxn_id)
-            old_ub = rxn_var.ub
-            old_secretion_upper[rxn_id] = old_ub
-            old_lb = rxn_var.lb
-            rxn_var.setAttr('ub', max(old_lb, 0))
-
+        
+        # Close all uptake and extra secretion
+        blocked_reactions = all_uptake + extra_secretion_rxns
         # Get max of secretion reaction
-        secretion_max = maximize_reaction(model, gp_model, secretion_rxn, perf_log=perf_log, preprocess_cache_dir=preprocess_cache_dir)
+        secretion_max = maximize_reaction(
+            model, 
+            opt, 
+            secretion_rxn, 
+            perf_log=perf_log, 
+            preprocess_cache_dir=preprocess_cache_dir, 
+            blocked_reactions=blocked_reactions, 
+            added_secretion=added_secretion, 
+            added_uptake=added_uptake
+        )
 
-        # Set contraint of max secretion to BETA*max
-        secretion_var = gp_model.getVarByName(secretion_rxn)
-        rhs = BETA * secretion_max
-        name = 'SECRETION_OPT'
-        gp_model.addConstr(secretion_var >= rhs, name=name)
+        # Constrain secretion to be at least BETA * v_r^opt
+        high_flux = { secretion_rxn: BETA * secretion_max }
 
-        # Find minimimum penalty
-        obj = gp.LinExpr()
-        # list contains elements of form (reaction, penalty) associated with the current sample
-        # This sets the objective to be v_1 * p_1 + v_2 * p_2 + ... + v_m * p_m
-        for rxn, penalty in reaction_penalties.items():
-            obj += penalty * gp_model.getVarByName(rxn)
-        gp_model.setObjective(obj, GRB.MINIMIZE)
-        gp_model.update()
+        # Minimize Penalty
+        delta = LinearProgramDelta(
+            objective=reaction_penalties, 
+            sense="min", 
+            added_secretion=added_secretion, 
+            added_uptake=added_uptake,
+            blocked_reactions=blocked_reactions, 
+            high_flux=high_flux
+        )
         
         if perf_log is not None:
             start_time = time.process_time()
-        #gp_model.optimize()
+
+        global_state.set_current_reaction_id(secretion_rxn)
+        sol = solve_model_wrapper(opt, delta)
+        secretion_scores[met_id] = sol.obj_value
+        
         if perf_log is not None:
             perf_log['min penalty time'][secretion_rxn] = time.process_time() - start_time
-        #value = gp_model.ObjVal
-        global_state.set_current_reaction_id(secretion_rxn)
-        value = optimize_model_wrapper(gp_model)
-        secretion_scores[met_id] = value
-
-        # Clear Secretion constraint
-        constr = gp_model.getConstrByName('SECRETION_OPT')
-        gp_model.remove(constr)
-
-        # Restore all uptake
-        for rxn_id, old_ub in old_uptake_upper.items():
-            uptake_var = gp_model.getVarByName(rxn_id)
-            uptake_var.setAttr('ub', old_ub)
-
-        # Restore extra secretion
-        for rxn_id, old_ub in old_secretion_upper.items():
-            secretion_var = gp_model.getVarByName(rxn_id)
-            secretion_var.setAttr('ub', old_ub)
 
         # -----------------
         # Optimal Uptake
         # -----------------
-
-        # Close extra uptake
-        old_uptake_upper = {}
-        for rxn_id in extra_uptake_rxns:
-            rxn_var = gp_model.getVarByName(rxn_id)
-            old_ub = rxn_var.ub
-            old_uptake_upper[rxn_id] = old_ub
-            old_lb = rxn_var.lb
-            rxn_var.setAttr('ub', max(old_lb, 0))
-
-        # Close all secretion
-        old_secretion_upper = {}
-        for rxn_id in all_secretion:
-            rxn_var = gp_model.getVarByName(rxn_id)
-            old_ub = rxn_var.ub
-            old_secretion_upper[rxn_id] = old_ub
-            old_lb = rxn_var.lb
-            rxn_var.setAttr('ub', max(old_lb, 0))
-
+        
+        # Close extra uptake and all secretion
+        blocked_reactions = extra_uptake_rxns + all_secretion
         # Get max of uptake reaction
-        uptake_max = maximize_reaction(model, gp_model, uptake_rxn, perf_log=perf_log, preprocess_cache_dir=preprocess_cache_dir)
+        uptake_max = maximize_reaction(
+            model, 
+            opt, 
+            uptake_rxn, 
+            perf_log=perf_log, 
+            preprocess_cache_dir=preprocess_cache_dir,
+            blocked_reactions=blocked_reactions, 
+            added_secretion=added_secretion, 
+            added_uptake=added_uptake
+        )
 
-        # Set contraint of max uptake with BETA*max
-        uptake_var = gp_model.getVarByName(uptake_rxn)
-        rhs = BETA * uptake_max
-        name = 'UPTAKE_OPT'
-        gp_model.addConstr(uptake_var >= rhs, name=name)
+        # Constrain uptake to be at least BETA * _r^opt
+        high_flux = { uptake_rxn: BETA * uptake_max }
 
-        # Find minimimum penalty
-        obj = gp.LinExpr()
-        # list contains elements of form (reaction, penalty) associated with the current sample
-        # This sets the objective to be v_1 * p_1 + v_2 * p_2 + ... + v_m * p_m
-        for rxn, penalty in reaction_penalties.items():
-            obj += penalty * gp_model.getVarByName(rxn)
-        gp_model.setObjective(obj, GRB.MINIMIZE)
-        gp_model.update()
+        # Minimize Penalty
+        delta = LinearProgramDelta(
+            objective=reaction_penalties, 
+            sense="min", 
+            added_secretion=added_secretion, 
+            added_uptake=added_uptake,
+            blocked_reactions=blocked_reactions, 
+            high_flux=high_flux
+        )
 
         if perf_log is not None:
             start_time = time.process_time()
-        #gp_model.optimize()
+
+        global_state.set_current_reaction_id(uptake_rxn)
+        sol = solve_model_wrapper(opt, delta)
+        uptake_scores[met_id] = sol.obj_value
+
         if perf_log is not None:
             perf_log['min penalty time'][uptake_rxn] = time.process_time() - start_time
-        #value = gp_model.ObjVal
-        global_state.set_current_reaction_id(uptake_rxn)
-        value = optimize_model_wrapper(gp_model)
-        uptake_scores[met_id] = value
 
-        # Clear Secretion constraint
-        constr = gp_model.getConstrByName('UPTAKE_OPT')
-        gp_model.remove(constr)
-
-        # Restore extra uptake
-        for rxn_id, old_ub in old_uptake_upper.items():
-            uptake_var = gp_model.getVarByName(rxn_id)
-            uptake_var.setAttr('ub', old_ub)
-
-        # Restore all secretion
-        for rxn_id, old_ub in old_secretion_upper.items():
-            secretion_var = gp_model.getVarByName(rxn_id)
-            secretion_var.setAttr('ub', old_ub)
-
-        # Remove added uptake and secretion reactions
-        if added_uptake:
-            uptake_var = gp_model.getVarByName(uptake_rxn)
-            gp_model.remove(uptake_var)
-        else:
+        # For reactions that were not artificially added, update the exchange_rxns dict
+        if not added_uptake:
             for rxn_id in all_uptake:
                 exchange_rxns[rxn_id] = uptake_scores[met_id]
 
-        if added_secretion:
-            secretion_var = gp_model.getVarByName(secretion_rxn)
-            gp_model.remove(secretion_var)
-        else:
+        if not added_secretion:
             for rxn_id in all_secretion:
                 exchange_rxns[rxn_id] = secretion_scores[met_id]
-
+            
     return uptake_scores, secretion_scores, exchange_rxns
 
-
-
-def compass_reactions(model, gp_model, reaction_penalties, perf_log=None, args = None, preprocess_cache_dir=PREPROCESS_CACHE_DIR):
+def compass_reactions(
+        model: MetabolicModel, 
+        opt: Optimizer, 
+        reaction_penalties: dict[str, float], 
+        perf_log=None, 
+        args = None, 
+        preprocess_cache_dir=PREPROCESS_CACHE_DIR
+    ):
 
     """
     Iterates through reactions, holding each near
@@ -491,26 +438,16 @@ def compass_reactions(model, gp_model, reaction_penalties, perf_log=None, args =
     if args['select_reactions'] or args['select_subsystems']:
         selected_reaction_ids = read_selected_reactions(args['select_reactions'], args['select_subsystems'], model)
         #r.id is a unidirectional identifier (ending with _pos or _neg suffix --> we remove it and compare to the undirected reaction id)
+        
         reactions = [r for r in reactions if (str(r.id)[:-4] in selected_reaction_ids or str(r.id) in selected_reaction_ids)]
-
 
     for reaction in tqdm(reactions, file=sys.stderr):
 
         if reaction.is_exchange:
             continue
-
-        partner_reaction = reaction.reverse_reaction
-
-        # Set partner reaction upper-limit to 0 in problem
-        # Store old limit for later to restore
-        if partner_reaction is not None:
-            partner_id = partner_reaction.id
-            partner_var = gp_model.getVarByName(partner_id)
-            old_partner_ub = partner_var.ub
-            old_partner_lb = partner_var.lb
-            partner_var.setAttr('ub', max(old_partner_lb, 0))
         
-        r_max = maximize_reaction(model, gp_model, reaction.id, perf_log=perf_log, preprocess_cache_dir=preprocess_cache_dir)
+        # Logic for blocking partner reaction now in maximize_reaction
+        r_max = maximize_reaction(model, opt, reaction.id, perf_log=perf_log, preprocess_cache_dir=preprocess_cache_dir)
 
         # If Reaction can't carry flux anyways (v_r^opt = 0), just continue
         if r_max == 0:
@@ -520,186 +457,126 @@ def compass_reactions(model, gp_model, reaction_penalties, perf_log=None, args =
                #perf_log['blocked'][reaction.id] = True
 
         else:
-            expr = gp.LinExpr()
-            expr += gp_model.getVarByName(reaction.id)
-            rhs = BETA * r_max
-            name = 'REACTION_OPT'
-            gp_model.addConstr(expr >= rhs, name=name)
+            
+            # Block reverse reaction
+            blocked_reactions = []
+            if reaction.reverse_reaction:
+                blocked_reactions.append(reaction.reverse_reaction.id)
+
+            # Constrain reaction to be at least BETA * v_r^opt
+            high_flux = { reaction.id: BETA * r_max }
 
             # Minimize Penalty
-            # TODO: does not check if objective name is 'reaction_penalties'
-            # because gurobi does not assign names to objectives
-            obj = gp.LinExpr()
-            # list contains elements of form (reaction, penalty) associated with the current sample
-            # This sets the objective to be v_1 * p_1 + v_2 * p_2 + ... + v_m * p_m
-            for rxn, penalty in reaction_penalties.items():
-                obj += penalty * gp_model.getVarByName(rxn)
-            gp_model.setObjective(obj, GRB.MINIMIZE)
-            gp_model.update()
+            delta = LinearProgramDelta(
+                objective=reaction_penalties, 
+                sense="min", 
+                blocked_reactions=blocked_reactions, 
+                high_flux=high_flux
+            )
 
             if perf_log is not None:
                 #perf_log['blocked'][reaction.id] = False
                 start_time = time.process_time()
 
-            #gp_model.optimize()
+            global_state.set_current_reaction_id(reaction.id)
+            sol = solve_model_wrapper(opt, delta)
+            reaction_scores[reaction.id] = sol.obj_value
 
             # TODO: modify for gurobi
             if perf_log is not None:
                 perf_log['min penalty time'][reaction.id] = time.process_time() - start_time
-                perf_log['min penalty method'][reaction.id] = gp_model.getParamInfo('Method')
+                #perf_log['min penalty method'][reaction.id] = gp_model.getParamInfo('Method')
                 #perf_log['min penalty sensitvivity'][reaction.id] = problem.solution.sensitivity.objective(reaction.id)
                 #if hasattr(problem.solution.get_quality_metrics(),'kappa'):
                    #perf_log['kappa'][reaction.id] = problem.solution.get_quality_metrics().kappa
 
-            #value = gp_model.ObjVal
-            global_state.set_current_reaction_id(reaction.id)
-            value = optimize_model_wrapper(gp_model)
-            reaction_scores[reaction.id] = value
-
-            if args['save_argmaxes']:
-                gp_model.write(os.path.join(args['save_argmaxes_dir'], f'{reaction.id}.sol'))
-
-            # Remove Constraint
-            constr = gp_model.getConstrByName('REACTION_OPT')
-            gp_model.remove(constr)
-
-        # Restore limit of partner reaction to old state
-        if partner_reaction is not None:
-            partner_id = partner_reaction.id
-
-            partner_var = gp_model.getVarByName(partner_id)
-            partner_var.setAttr('ub', old_partner_ub)
+            #if args['save_argmaxes']:
+            #    gp_model.write(os.path.join(args['save_argmaxes_dir'], f'{reaction.id}.sol'))
 
     return reaction_scores
 
-
-def initialize_gurobi_model(model, credentials, num_threads=1, lpmethod=-1, adv=2):
-    # type: (compass.models.MetabolicModel)
+def initialize_optimization(model: MetabolicModel, args) -> Optimizer:
     """
-    Builds and returns a gurobi model representing our metabolic model
-
-    Limits exchange reactions and makes all reactions unidirectional
-    by splitting into two components
+    Builds a flux balance analysis model from the specified metabolic model.
+    Uses args to determine which optimizer will be used and how to configure it.
     """
+    num_threads = args.get('num_threads')
+    lpmethod = args.get('lpmethod')
+    if args['optimizer'] == "gurobi":
+        credentials = utils.get_gurobi_credentials()
+        config = get_gurobi_config(num_threads, lpmethod)
+        return GurobiOptimizer(model, config, credentials=credentials)
+    elif args['optimizer'] == "cuopt":
+        from compass.opt.cuopt import CuoptOptimizer, get_cuopt_config
+        config = get_cuopt_config(num_threads, method=lpmethod)
+        return CuoptOptimizer(model, config)
 
-    # Create the Gurobi model
-
-    # Gurobi WLS License
-    if 'WLSACCESSID' in credentials and 'WLSSECRET' in credentials and 'LICENSEID' in credentials:
-        env = gp.Env(params=credentials)
-    # Gurobi Named-User License
-    else:
-        env = gp.Env()
-    
-    gp_model = gp.Model(env=env)
-
-    # Set Parameters for the Gurobi model
-
-    gp_model.setParam("OutputFlag", 0)  # Disable all output
-    gp_model.setParam("LogToConsole", 0)  # Disable console output
-
-    # Set numerical emphasis to improve precision
-    gp_model.setParam("NumericFocus", 3)  # Equivalent to numerical emphasis in CPLEX
-
-    # Set number of threads
-    gp_model.setParam("Threads", num_threads)  # Set the number of threads to use
-
-    # Set the primal and dual preprocessing options
-    gp_model.setParam("Presolve", 2)  # 2 means aggressive presolve, 1 for conservative, 0 for off
-
-    # Set optimization method
-    gp_model.setParam("Method", lpmethod)  # 0: Automatic, 1: Primal Simplex, 2: Dual Simplex, etc.
-
-    # Set optimality tolerance
-    gp_model.setParam("OptimalityTol", 1e-9)  # Default is 1e-6, minimum is 1e-9
-
-    # Set barrier convergence tolerance
-    gp_model.setParam("BarConvTol", 1e-12)  # Default is 1e-8, minimum is 1e-12
-
-    gp_model.setParam(GRB.Param.Threads, num_threads)
-    gp_model.setParam(GRB.Param.Method, lpmethod)
-
-    # Add variables
-    reactions = list(model.reactions.values())
-
-    # Define minimum and maximum flux for each reaction
-    for x in reactions:
-        gp_model.addVar(
-            lb=x.lower_bound, 
-            ub=x.upper_bound, 
-            name=x.id, 
-            vtype=GRB.CONTINUOUS)
-    gp_model.update()
-
-    # Add constraints
-
-    # Add stoichiometry constraints
-
-    '''
-    utils.get_steadystate_constraints
-
-    For each metabolite:
-        c_lin_expr is the zero flux linear expression, of form
-            c_1 * r_1 + c_2 * r_2 + ... + c_m * r_m = 0
-        sense is 'E', representing equal to 0
-        rhs is 0
-        name of corresponding metabolite is given to entire linear expression, not variables
-    '''
-
-    c_lin_expr, c_rhs, c_names = (
-        utils.get_steadystate_constraints(model, gp_model))
-
-    for lin_expr, rhs, name in zip(c_lin_expr, c_rhs, c_names):
-        gp_model.addConstr(lin_expr == rhs, name=name)
-    gp_model.update()
-
-    # Initialize the objective
-    ### utils.reset_objective(gp_model)
-
-    return gp_model
-
-
-def maximize_reaction(model, gp_model, rxn, use_cache=True, perf_log=None, preprocess_cache_dir=PREPROCESS_CACHE_DIR):
-
-    """Maximizes the current reaction in the problem
-    Attempts to retrieve the value from cache if its in cache
+def maximize_reaction(
+        model: MetabolicModel, 
+        opt: Optimizer, 
+        rxn_id: str, 
+        use_cache=True, 
+        perf_log=None, 
+        preprocess_cache_dir=PREPROCESS_CACHE_DIR,
+        blocked_reactions: list[str] | None = None,
+        added_secretion: dict | None = None,
+        added_uptake: dict | None = None,
+    ):
     """
-    
+    Maximizes the current reaction in the problem
+    Attempts to retrieve the value from cache, and populates the cache on a cache miss
+    The blocked_reactions, added_secretion, and added_uptake parameters are used for compass_exchange
+    """
+    if blocked_reactions is None:
+        blocked_reactions = []
+    if added_secretion is None:
+        added_secretion = {}
+    if added_uptake is None:
+        added_uptake = {}
+
     if perf_log is not None:
         start_time = time.process_time()
-        perf_log['order'][rxn] = len(perf_log['order'])
+        perf_log['order'][rxn_id] = len(perf_log['order'])
 
     # Load from cache if it exists and return
     if use_cache:
         model_cache = cache.load(model, preprocess_cache_dir=preprocess_cache_dir)
-        if rxn in model_cache:
+        if rxn_id in model_cache:
             if perf_log is not None:
-                perf_log['cached'][rxn] = True
-                perf_log['max rxn time'][rxn] = time.process_time() - start_time
-            return model_cache[rxn]
+                perf_log['cached'][rxn_id] = True
+                perf_log['max rxn time'][rxn_id] = time.process_time() - start_time
+            return model_cache[rxn_id]
+
+    # Set partner reaction upper-limit to 0 in problem, if it exists
+    rxn = model.reactions.get(rxn_id)
+    if rxn.reverse_reaction:
+        blocked_reactions.append(rxn_id.reverse_reaction.id)
 
     # Maximize the reaction
-    ### utils.reset_objective(gp_model)
-    gp_model.setObjective(gp_model.getVarByName(rxn), GRB.MAXIMIZE)
-    gp_model.update()
-
-    #gp_model.optimize()
-    #rxn_max = gp_model.ObjVal
-    global_state.set_current_reaction_id(rxn)
-    rxn_max = optimize_model_wrapper(gp_model)
+    objective = { rxn_id : 1.0 }
+    delta = LinearProgramDelta(
+        objective=objective, 
+        sense="max", 
+        blocked_reactions=blocked_reactions, 
+        added_secretion=added_secretion, 
+        added_uptake=added_uptake
+    )
+    
+    global_state.set_current_reaction_id(rxn_id)
+    sol = solve_model_wrapper(opt, delta)
 
     # Save the result
     model_cache = cache.load(model, preprocess_cache_dir=preprocess_cache_dir)
-    model_cache[rxn] = rxn_max
+    model_cache[rxn_id] = sol.obj_value
 
     if perf_log is not None:
-        perf_log['cached'][rxn] = False
-        perf_log['max rxn time'][rxn] = time.process_time() - start_time
-        # TODO: modify for gurobi
+        perf_log['cached'][rxn_id] = False
+        perf_log['max rxn time'][rxn_id] = time.process_time() - start_time
+        # TODO: modify for gurobi/cuopt
         #perf_log['max rxn method'][rxn] = problem.solution.get_method()
-        perf_log['max rxn method'][rxn] = gp_model.getParamInfo('Method')
+        #perf_log['max rxn method'][rxn] = gp_model.getParamInfo('Method')
 
-    return rxn_max
+    return sol.obj_value
 
 def maximize_reaction_range(start_stop, args, model_name=None, metabolic_model_dir=MODEL_DIR):
     """
@@ -722,44 +599,35 @@ def maximize_reaction_range(start_stop, args, model_name=None, metabolic_model_d
 
     #make a sub cache for each thread to write into
     sub_cache = {}
+
     model = models.init_model(model=model_name, species=args['species'],
                        exchange_limit=EXCHANGE_LIMIT, media=args['media'], 
                        isoform_summing=args['isoform_summing'], metabolic_model_dir=metabolic_model_dir)
-    credentials = utils.parse_gurobi_license_file(os.path.join(LICENSE_DIR, 'gurobi.lic'))
-    gp_model = initialize_gurobi_model(model, credentials, args['num_threads'], args['lpmethod'])
+    opt = initialize_optimization(model, args)
 
     #sort by id to ensure consistency across threads
     reactions = sorted(list(model.reactions.values()), key=lambda r:r.id)[start_stop[0]:start_stop[1]]
     for reaction in tqdm(reactions, file=sys.stderr):
         #if reaction.is_exchange:
         #    continue
+        blocked_reactions = []
         partner_reaction = reaction.reverse_reaction
 
         # Set partner reaction upper-limit to 0 in problem
-        # Store old limit for later to restore
         if partner_reaction is not None:
-            partner_id = partner_reaction.id
-            partner_var = gp_model.getVarByName(partner_id)
-            old_partner_ub = partner_var.ub
-            old_partner_lb= partner_var.lb
-            partner_var.setAttr('ub', max(old_partner_lb, 0))
-        
+            blocked_reactions.append(partner_reaction.id)
 
-        utils.reset_objective(gp_model)
-        gp_model.setObjective(gp_model.getVarByName(reaction.id), GRB.MAXIMIZE)
-        gp_model.update()
+        objective = { reaction.id : 1.0 }
+        delta = LinearProgramDelta(
+            objective=objective, 
+            sense="max", 
+            blocked_reactions=blocked_reactions, 
+            added_secretion={}, 
+            added_uptake={}
+        )
+        sol = solve_model_wrapper(opt, delta)
 
-        gp_model.optimize()
-        rxn_max = gp_model.ObjVal
-
-        sub_cache[reaction.id] = rxn_max
-
-        # Restore limit of partner reaction to old state
-        if partner_reaction is not None:
-            partner_id = partner_reaction.id
-
-            partner_var = gp_model.getVarByName(partner_id)
-            partner_var.setAttr('ub', old_partner_ub)
+        sub_cache[reaction.id] = sol.obj_value
 
     return sub_cache
 
@@ -781,21 +649,20 @@ def maximize_metab_range(start_stop, args, model_name=None, metabolic_model_dir=
     model = models.init_model(model=model_name, species=args['species'],
                        exchange_limit=EXCHANGE_LIMIT, media=args['media'], 
                        isoform_summing=args['isoform_summing'], metabolic_model_dir=metabolic_model_dir)
-    credentials = utils.parse_gurobi_license_file(os.path.join(LICENSE_DIR, 'gurobi.lic'))
-    gp_model = initialize_gurobi_model(model, credentials, args['num_threads'], args['lpmethod'])
+    opt = initialize_optimization(model, args)
 
     # init_model returns entire list of metabolites as specified by the RECON2 model
     # However, some metabolites are not associated with any reactions,
     # and maximize_metab_range only computes those that are associated with reactions
     # Therefore model.species might contain metabolites that don't need to be maximized at all
-    metabolites = sorted(list(model.species.values()), key=lambda r:r.id)[start_stop[0]:start_stop[1]]
+    metabolites = sorted(list(model.species.values()), key=lambda m:m.id)[start_stop[0]:start_stop[1]]
 
     for metabolite in tqdm(metabolites, file=sys.stderr):
 
         met_id = metabolite.id
-        met_id_constr = gp_model.getConstrByName(met_id)
+        metabolite_used = model.is_metabolite_used(metabolite_id=met_id)
 
-        if met_id_constr is None:
+        if not metabolite_used:
             # This can happen if the metabolite does not participate
             # in any reaction. As a result, it won't be in any
             # constraints - happens in RECON2
@@ -810,12 +677,12 @@ def maximize_metab_range(start_stop, args, model_name=None, metabolic_model_dir=
         secretion_rxn = None
         extra_secretion_rxns = []
 
-        added_uptake = False     # Did we add an uptake reaction?
-        added_secretion = False  # "   "   "  "  secretion reaction?
+        # Maps the metabolite id to the name of the new reaction
+        added_uptake = {}     # Did we add an uptake reaction?
+        added_secretion = {}  # "   "   "  "  secretion reaction?
 
         # Metabolites represented by a constraint: get associated reactions
-        sp = gp_model.getRow(met_id_constr)
-        rxn_ids = [sp.getVar(i).varname for i in range(sp.size())]
+        rxn_ids = model.associated_reactions(met_id)
         reactions = [model.reactions[x] for x in rxn_ids]
 
         # NOTE: only_exchange flag does not apply to maximize_metab_range
@@ -843,41 +710,13 @@ def maximize_metab_range(start_stop, args, model_name=None, metabolic_model_dir=
 
         #if the selected_rxns or only_exchange options are used --> then we don't want to add reactions unless one of the pair already exists
 
-        if (secretion_rxn is None):
-            added_secretion = True
+        if secretion_rxn is None:
             secretion_rxn = met_id + "_SECRETION"
+            added_secretion[met_id] = secretion_rxn
 
-            # Add secretion reaction to the problem as a variable
-            rxn_index = gp_model.addVar(
-                name=secretion_rxn,
-                ub=model.maximum_flux,
-                lb=0.0,
-                vtype=GRB.CONTINUOUS,
-            )
-
-            # Add it to the metabolites constraint
-            gp_model.chgCoeff(met_id_constr, rxn_index, -1.0)
-            gp_model.update()
-
-
-        #if only exchange flag is set - don't add uptakes that do not exist
-        if (uptake_rxn is None):
-            added_uptake = True
+        if uptake_rxn is None:
             uptake_rxn = met_id + "_UPTAKE"
-
-            # Add uptake reaction to the problem as a variable
-            rxn_index = gp_model.addVar(
-                name=uptake_rxn,
-                ub=EXCHANGE_LIMIT,
-                lb=0.0,
-                vtype=GRB.CONTINUOUS,
-            )
-
-            # Add it to the metabolite's constraint
-            # TODO: need to check if met_id_constr is modified by secrete_rxn
-            # Find way to remove gp_model.update() in secrete_rxn
-            gp_model.chgCoeff(met_id_constr, rxn_index, 1.0)
-            gp_model.update()
+            added_uptake[met_id] = uptake_rxn
 
         # Modify the constraint in the problem
         #   e.g. Add the metabolites connections
@@ -888,119 +727,57 @@ def maximize_metab_range(start_stop, args, model_name=None, metabolic_model_dir=
         # Optimal Secretion
         # -----------------
 
-        # Close all uptake, storing their upper-bounds to restore later
-        old_uptake_upper = {}
-        for rxn_id in all_uptake:
-            rxn_var = gp_model.getVarByName(rxn_id)
-            old_ub = rxn_var.ub
-            old_uptake_upper[rxn_id] = old_ub
-            old_lb = rxn_var.lb
-            rxn_var.setAttr('ub', max(old_lb, 0))
-
-        # Close extra secretion, storing upper-bounds to restore later
-        old_secretion_upper = {}
-        for rxn_id in extra_secretion_rxns:
-            rxn_var = gp_model.getVarByName(rxn_id)
-            old_ub = rxn_var.ub
-            old_secretion_upper[rxn_id] = old_ub
-            old_lb = rxn_var.lb
-            rxn_var.setAttr('ub', max(old_lb, 0))
-
-        gp_model.update()
+        # Close all uptake and extra secretion
+        blocked_reactions = all_uptake + extra_secretion_rxns
 
         # Get max of secretion reaction
-        #secretion_max = maximize_reaction(model, problem, secretion_rxn)
-        utils.reset_objective(gp_model)
-        gp_model.setObjective(gp_model.getVarByName(secretion_rxn), GRB.MAXIMIZE)
-
-        gp_model.optimize()
-        rxn_max = gp_model.ObjVal
+        objective = { secretion_rxn : 1.0 }
+        delta = LinearProgramDelta(
+            objective=objective, 
+            sense="max", 
+            blocked_reactions=blocked_reactions, 
+            added_secretion=added_secretion, 
+            added_uptake=added_uptake,
+        )
+        sol = solve_model_wrapper(opt, delta)
 
         # NOTE: since only_exchange flag is not applicable here, additional secretion reactions
         # can be created and added to the cache
-        sub_cache[secretion_rxn] = rxn_max
-
-        # Restore all uptake
-        for rxn_id, old_ub in old_uptake_upper.items():
-            uptake_var = gp_model.getVarByName(rxn_id)
-            uptake_var.setAttr('ub', old_ub)
-
-        # Restore extra secretion
-        for rxn_id, old_ub in old_secretion_upper.items():
-            secretion_var = gp_model.getVarByName(rxn_id)
-            secretion_var.setAttr('ub', old_ub)
-
-        gp_model.update()
+        sub_cache[secretion_rxn] = sol.obj_value
 
         # -----------------
         # Optimal Uptake
         # -----------------
 
-        # Close extra uptake
-        old_uptake_upper = {}
-        for rxn_id in extra_uptake_rxns:
-            rxn_var = gp_model.getVarByName(rxn_id)
-            old_ub = rxn_var.ub
-            old_uptake_upper[rxn_id] = old_ub
-            old_lb = rxn_var.lb
-            rxn_var.setAttr('ub', max(old_lb, 0))
-
-        # Close all secretion
-        old_secretion_upper = {}
-        for rxn_id in all_secretion:
-            rxn_var = gp_model.getVarByName(rxn_id)
-            old_ub = rxn_var.ub
-            old_secretion_upper[rxn_id] = old_ub
-            old_lb = rxn_var.lb
-            rxn_var.setAttr('ub', max(old_lb, 0))
-
-        gp_model.update()
+        # Close extra uptake and all secretion
+        blocked_reactions = extra_uptake_rxns + all_secretion
 
         # Get max of uptake reaction
-        #uptake_max = maximize_reaction(model, problem, uptake_rxn)
-        utils.reset_objective(gp_model)
-        gp_model.setObjective(gp_model.getVarByName(uptake_rxn), GRB.MAXIMIZE)
-
-        gp_model.optimize()
-        rxn_max = gp_model.ObjVal
+        objective = { uptake_rxn : 1.0 }
+        delta = LinearProgramDelta(
+            objective=objective, 
+            sense="max", 
+            blocked_reactions=blocked_reactions, 
+            added_secretion=added_secretion, 
+            added_uptake=added_uptake,
+        )
+        sol = solve_model_wrapper(opt, delta)
 
         # NOTE: since only_exchange flag is not applicable here, additional uptake reactions
         # can be created and added to the cache
-        sub_cache[uptake_rxn] = rxn_max
-
-        # Restore extra uptake
-        for rxn_id, old_ub in old_uptake_upper.items():
-            uptake_var = gp_model.getVarByName(rxn_id)
-            uptake_var.setAttr('ub', old_ub)
-
-        # Restore all secretion
-        for rxn_id, old_ub in old_secretion_upper.items():
-            secretion_var = gp_model.getVarByName(rxn_id)
-            secretion_var.setAttr('ub', old_ub)
-
-        gp_model.update()
-
-        # Remove added uptake and secretion reactions
-        if added_uptake:
-            uptake_var = gp_model.getVarByName(uptake_rxn)
-            gp_model.remove(uptake_var)
-
-        if added_secretion:
-            secretion_var = gp_model.getVarByName(secretion_rxn)
-            gp_model.remove(secretion_var)
-
-        gp_model.update()
+        sub_cache[uptake_rxn] = sol.obj_value
             
     return sub_cache
-
-
-def optimize_model_wrapper(gp_model) -> float:
+    
+def solve_model_wrapper(opt: Optimizer, delta: LinearProgramDelta) -> Solution:
     r"""
-    Only optimize the Gurobi model if the reaction is selected for the cell. Else,
-    skip the computation and return np.nan.
+    Only optimize the model if the reaction is selected for the cell. Else,
+    skip the computation and return np.nan as the optimal value
     """
     if global_state.current_reaction_is_selected_for_current_cell():
-        gp_model.optimize()
-        return gp_model.ObjVal
+        sol = opt.solve(delta)
+        if not sol.success:
+            logger.error("Failed to solve linear program: %s", sol.status)
+        return sol
     else:
-        return np.nan
+        return Solution(success=True, status="Skipped", obj_value=np.nan)

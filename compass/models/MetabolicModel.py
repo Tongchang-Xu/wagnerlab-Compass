@@ -72,6 +72,7 @@ class MetabolicModel(object):
         self._maximum_flux = None
         self.media = 'NoMedia'
         self.metabolic_model_dir = metabolic_model_dir
+        self._SMAT = None
 
     def getReactions(self):
         """
@@ -161,6 +162,12 @@ class MetabolicModel(object):
             else:
                 raise Exception("Should not occur")
 
+    @property
+    def SMAT(self):
+        if self._SMAT is None:
+            self._SMAT = self.getSMAT()
+        return self._SMAT
+
     def getSMAT(self):
         """
         Returns a sparse form of the s-matrix
@@ -196,6 +203,24 @@ class MetabolicModel(object):
                 s_mat[metabolite].append((reaction_id, coefficient))
 
         return s_mat
+    
+
+    def is_metabolite_used(self, metabolite_id) -> bool:
+        """
+        Returns whether the metabolite occurs in any reactions in the model
+        """
+        return metabolite_id in self.SMAT
+    
+    def associated_reactions(self, metabolite_id) -> list[str]:
+        """
+        Returns a list of all reactions id's that have this metabolite as a product or reactant
+        Returns an empty list if the metabolite_id does not exist in the model
+        """
+        smat = self.SMAT
+        if metabolite_id in smat:
+            return [reaction_id for reaction_id, _ in smat[metabolite_id]]
+        else:
+            return []
     
     def getSMAT_transposed(self):
         """

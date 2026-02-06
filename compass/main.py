@@ -23,7 +23,7 @@ from math import ceil
 from .compass import cache
 from ._version import __version__
 from .compass.torque import submitCompassTorque
-from .compass.algorithm import singleSampleCompass, maximize_reaction_range, maximize_metab_range, initialize_gurobi_model
+from .compass.algorithm import singleSampleCompass, maximize_reaction_range, maximize_metab_range
 from .compass.microclustering import microcluster, pool_matrix_cols, unpool_columns
 from .models import init_model
 from .models.partitionModel import partition_model
@@ -49,7 +49,10 @@ def parseArgs():
                         prog="Compass",
                         description="Compass version "+str(__version__)+
                         ". Metabolic Modeling for Single Cells. "
-                        "For more details on usage refer to the documentation: https://yoseflab.github.io/Compass/")
+                        "For more details on usage refer to the documentation: https://github.com/wagnerlab-berkeley/Compass",
+                        add_help=False)
+
+    parser.add_argument('-h', '--help', action='store_true', help='show this help message and exit')
 
     parser.add_argument("--data", help="Gene expression matrix." 
                         " Should be a tsv file with one row per gene and one column per sample", 
@@ -354,11 +357,11 @@ def parseArgs():
                         help=argparse.SUPPRESS,
                         default='')
 
-    #Hidden argument to choose the algorithm CPLEX uses. Barrier generally best choice.
+    #Hidden argument to choose the algorithm the optimizer uses. Barrier generally best choice.
     #See - https://www.ibm.com/support/knowledgecenter/en/SS9UKU_12.10.0/com.ibm.cplex.zos.help/CPLEX/Parameters/topics/LPMETHOD.html
     parser.add_argument("--lpmethod",
                         help=argparse.SUPPRESS,
-                        default=4,
+                        default=None,
                         type=int)
 
     #Hidden argument to choose the setting for Cplex's advanced basis setting. Generally 2 is the best, but for ease of testing I've added it here.
@@ -385,7 +388,25 @@ def parseArgs():
     parser.add_argument("--list-reactions", default=None, metavar="FILE",
                         help="File to output a list of reaction id's and their associated subsystem for selected metabolic model.")
 
-    args = parser.parse_args()
+    parser.add_argument("--optimizer",
+                        help = "Select an optimization software to solve flux balance analysis problems with. Select an optimizer with --help to see options specific to the optimizer",
+                        choices=["gurobi", "cuopt"],
+                        default="gurobi")
+
+    # Parse known args first to check for optimizer setting
+    args, _ = parser.parse_known_args()
+
+    if args.optimizer == "cuopt":
+        default_method = 1 #pdlp 
+    elif args.optimizer == "gurobi":
+        default_method = 4
+    
+    if args.lpmethod is None:
+        args.lpmethod = default_method
+
+    if args.help:
+        parser.print_help()
+        sys.exit(0)
 
     args = vars(args)  # Convert to a Dictionary
 
@@ -536,7 +557,7 @@ def entry():
                 fout.close()
 
         elif os.path.exists(temp_args_file):
-            #Handle ths before making logger because the logger redirected outputs
+            #Handle this before making logger because the logger redirected outputs
             with open(temp_args_file, 'r') as fin:
                 temp_args =  json.load(fin)
                 fin.close()
@@ -592,6 +613,15 @@ def entry():
 
     logger.debug("\nCOMPASS Started: {}".format(start_time))
     # Parse arguments and decide what course of action to take
+
+    compass_work(args, logger, start_time)
+
+
+def compass_work(args, logger, start_time):
+    """
+    Main work of the algorithm, including deciding what steps to take based on arguments is here
+    This is split from entry() to enable using a try block around it (useful in followup PR)
+    """
 
     if args['turbo'] < 1.0:
 
@@ -662,7 +692,7 @@ def entry():
                     
                     n_samples = penalties.shape[1]
 
-                    pool = multiprocessing.Pool(args['num_processes'])
+                    pool = utils.create_process_pool(args)
 
                     pbar = tqdm(total=n_samples)
 
@@ -708,7 +738,7 @@ def entry():
                     os.mkdir(penalties_dir)
                 
                 n_samples = penalties.shape[1]
-                pool = multiprocessing.Pool(args['num_processes'])
+                pool = utils.create_process_pool(args)
 
                 logger.info('Saving Reaction Penalties for individual samples')
                 pbar = tqdm(total=n_samples)
@@ -958,7 +988,7 @@ def entry():
                             os.mkdir(penalties_dir)
 
                         n_samples = penalties.shape[1]
-                        pool = multiprocessing.Pool(args['num_processes'])
+                        pool = utils.create_process_pool(args)
 
                         logger.info('Saving Reaction Penalties for individual samples')
 
@@ -1073,7 +1103,7 @@ def entry():
                         os.mkdir(penalties_dir)
 
                     n_samples = penalties.shape[1]
-                    pool = multiprocessing.Pool(args['num_processes'])
+                    pool = utils.create_process_pool(args)
 
                     logger.info('Saving Reaction Penalties for individual samples')
                     pbar = tqdm(total=n_samples)
@@ -1251,7 +1281,7 @@ def entry():
                         os.mkdir(penalties_dir)
                     
                     n_samples = penalties.shape[1]
-                    pool = multiprocessing.Pool(args['num_processes'])
+                    pool = utils.create_process_pool(args)
 
                     logger.info('Saving Reaction Penalties for individual samples')
                     pbar = tqdm(total=n_samples)
@@ -1393,7 +1423,7 @@ def entry():
                     os.mkdir(penalties_dir)
                 
                 n_samples = penalties.shape[1]
-                pool = multiprocessing.Pool(args['num_processes'])
+                pool = utils.create_process_pool(args)
 
                 logger.info('Saving Reaction Penalties for individual samples')
                 pbar = tqdm(total=n_samples)
@@ -1474,7 +1504,7 @@ def runCompassParallel(args, model_name=None, temp_dir=None, output_dir=None, me
     sample_names = list(data.columns)
     del data
 
-    pool = multiprocessing.Pool(args['num_processes'])
+    pool = utils.create_process_pool(args)
 
     logger.info(
         "Processing {} samples using {} processes"
@@ -1722,9 +1752,15 @@ def load_config(args):
     args.update(newArgs)
 
 def _parallel_map_precache_reactions(start_stop, args, model_name=None, metabolic_model_dir=MODEL_DIR):
+    global_state.init_selected_reactions_for_each_cell(
+        args.get('selected_reactions_for_each_cell', None))
+    
     return maximize_reaction_range(start_stop, args, model_name=model_name, metabolic_model_dir=metabolic_model_dir)
 
 def _parallel_map_precache_metabs(start_stop, args, model_name=None, metabolic_model_dir=MODEL_DIR):
+    global_state.init_selected_reactions_for_each_cell(
+        args.get('selected_reactions_for_each_cell', None))
+    
     return maximize_metab_range(start_stop, args, model_name=model_name, metabolic_model_dir=metabolic_model_dir)
 
 def precacheCompass(args, model_name=None, metabolic_model_dir=MODEL_DIR, preprocess_cache_dir=PREPROCESS_CACHE_DIR):
@@ -1760,7 +1796,7 @@ def precacheCompass(args, model_name=None, metabolic_model_dir=MODEL_DIR, prepro
 
         combined_cache = {}
         partial_map_fun = partial(_parallel_map_precache_reactions, args=args, model_name=model_name, metabolic_model_dir=metabolic_model_dir)
-        pool = multiprocessing.Pool(n_processes)
+        pool = utils.create_process_pool(args)
         for sub_cache in pool.imap_unordered(partial_map_fun, reaction_chunks):
             combined_cache.update(sub_cache)
         
@@ -1768,7 +1804,7 @@ def precacheCompass(args, model_name=None, metabolic_model_dir=MODEL_DIR, prepro
         metab_chunks = [(i*metab_chunk_size, min(n_metabs, (i+1)*metab_chunk_size)) for i in range(n_processes)]
 
         partial_map_fun = partial(_parallel_map_precache_metabs, args=args, model_name=model_name, metabolic_model_dir=metabolic_model_dir)
-        pool = multiprocessing.Pool(n_processes)
+        pool = utils.create_process_pool(args)
         for sub_cache in pool.imap_unordered(partial_map_fun, metab_chunks):
             combined_cache.update(sub_cache)
 
