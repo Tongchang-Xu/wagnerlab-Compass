@@ -17,8 +17,8 @@ setup(
                   ['compass = compass.main:entry']},
 
     install_requires=[
-        'numpy>=1.12',
-        'pandas>=0.20',
+        'numpy>=1.12,<2.0.0',
+        'pandas>=0.20,<2.0.0',
         'tqdm>=4.11',
         'python-libsbml>=5.13',
         'six>=1.10',
@@ -26,8 +26,8 @@ setup(
         'scipy>=1.0',
         'python-igraph>=0.9', #Need the version to be high enough fgo
         'leidenalg>=0.8.2',
-        'anndata',
-        'gurobipy>=11.0.0'],
+        'anndata<0.10.0',
+        'gurobipy>=11.0.0,<13.0.0'],
 
     author="Charles Chien",
     author_email="charleschien101@gmail.com",
